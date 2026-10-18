@@ -1,0 +1,6 @@
+node_modules/
+.scratch/
+.cocoindex_code/
+.gitnexus/
+.pi/
+package-lock.json

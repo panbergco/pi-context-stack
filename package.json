@@ -1,0 +1,45 @@
+{
+  "name": "pi-context-stack",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "bin": {
+    "pi-context-stack": "./bin/pi-context-stack.mjs"
+  },
+  "description": "Checkpoints instead of compaction for pi: stacked summaries, lossless recall, the prompt cache kept",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/panbergco/pi-context-stack.git"
+  },
+  "files": [
+    "README.md",
+    "bin",
+    "skills",
+    "src"
+  ],
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}
