@@ -12,7 +12,9 @@ writes only its new summary. Nothing is deleted: the session file keeps every me
 
 **When a summary lacks a detail you need**, do not guess and do not redo the work — call
 `context_stack_recall` with `checkpoint: k` (the number in `[context-stack checkpoint summary] k`) and
-`match: "<text>"` for only the matching lines, or no `match` for the whole span in slices (`offset`).
+`match: "<text>"` for only the matching lines (each with the message it came from), or no `match` for the whole
+span in slices (`offset`). Omit `checkpoint` and give `match` to search every checkpoint at once. In reference mode
+(`density: 0`) checkpoints are indexes, not summaries: recall is how you read what they cover.
 
 ## When checkpoints happen
 
@@ -26,7 +28,7 @@ task): `every: off`, `replaceCompaction: false`.
 | `enabled` | `true` | |
 | `every` | `10%` | growth that triggers one: share of the window, tokens (`100k`), or `off` |
 | `keep` | `0%` | newest share of the post-checkpoint tail kept verbatim |
-| `density` | `5%` | summary length as a share of the span it replaces |
+| `density` | `5%` | summary length as a share of the span it replaces; `0` = reference mode (no summary turn) |
 | `replaceCompaction` | `true` | take a checkpoint instead of pi's threshold compaction |
 
 Set in `~/.pi/agent/context-stack.json`, `<project>/.pi/context-stack.json`, `PI_CONTEXT_STACK_<NAME>` (upper

@@ -34,7 +34,10 @@ export interface Settings {
   every: string | number | null;
   /** Share of the tail since the last checkpoint kept verbatim at each checkpoint (0..0.9). */
   keep: number;
-  /** Target summary length as a share of the span it replaces (5% of 100k -> about 5k tokens). */
+  /**
+   * Target summary length as a share of the span it replaces (5% of 100k -> about 5k tokens).
+   * 0 = reference mode: no summary turn, the checkpoint is a deterministic index of the span pointing at recall.
+   */
   density: number;
   /** Take a checkpoint instead of pi's threshold compaction. Off = pi (or another extension) keeps its compaction. */
   replaceCompaction: boolean;
@@ -161,7 +164,14 @@ export function project<M extends MessageLike>(messages: M[], s: StackState): (M
   if (!s.enabled || s.checkpoints.length === 0) return null;
   const h = headEnd(messages, s);
   if (h < 0 && s.anchorTs !== null) return null;
-  return [...messages.slice(0, h + 1), ...s.checkpoints.map(summaryMessage), ...liveTail(messages, s)];
+  const tail = liveTail(messages, s);
+  // The request being worked on is never folded away: when the newest user message fell inside a summarised span,
+  // it is kept verbatim right after the stack (live run 2026-10-18: a reference-mode cut took the question with it,
+  // and the model answered nothing). Its order relative to the tail is unchanged; only what came between is gone.
+  let active = -1;
+  for (let i = messages.length - 1; i > h; i--) if (messages[i].role === "user") { active = i; break; }
+  const pinned = active > h && !tail.includes(messages[active]) ? [messages[active]] : [];
+  return [...messages.slice(0, h + 1), ...s.checkpoints.map(summaryMessage), ...pinned, ...tail];
 }
 
 export interface Cut {
@@ -184,7 +194,12 @@ export function chooseCut(messages: MessageLike[], s: StackState): Cut | null {
   const budget = s.keep * sizes.reduce((a, b) => a + b, 0);
   let i = tail.length;
   for (let kept = 0; i > 0 && kept + sizes[i - 1] <= budget; i--) kept += sizes[i - 1];
+  // Reference mode summarises nothing, so results nobody has read yet must not be folded: keep the newest step
+  // (the last assistant message and what came back to it). Live run 2026-10-19: a cut right after six recall
+  // results folded them away and the model fetched them all again.
+  if (s.density === 0) { const a = tail.map((m) => m.role).lastIndexOf("assistant"); if (a >= 0) i = Math.min(i, a); }
   while (i < tail.length && tail[i].role === "toolResult") i++;
+  if (i === 0 && s.density === 0) return null; // only the newest step is new: nothing to fold yet
   if (i === 0) { i = 1; while (i < tail.length && tail[i].role === "toolResult") i++; }
   const span = tail.slice(0, i);
   const h = headEnd(messages, s);
@@ -203,11 +218,48 @@ export function spanOf<M extends MessageLike>(messages: M[], s: StackState, k: n
   return messages.filter((m) => (m.timestamp ?? 0) > from && (m.timestamp ?? 0) <= c.cutTs && !isHidden(m) && m.customType !== PROMPT_TYPE && m.customType !== NUDGE_TYPE);
 }
 
+/**
+ * Reference mode (density 0): what a checkpoint says when no model summarises the span. Deterministic, so it costs
+ * no model turn and its bytes are fixed: the span's size and time, the files it read and wrote, the commands it ran,
+ * and the last thing the assistant said, all pointing at recall for the originals.
+ */
+export function referenceSummary(cut: Cut, k: number): string {
+  const reads = new Set<string>(), writes = new Set<string>(), commands: string[] = [];
+  let last = "";
+  for (const m of cut.span) {
+    if (m.role === "assistant") { const t = textOf(m); if (t) last = t; }
+    if (!Array.isArray(m.content)) continue;
+    for (const c of m.content as any[]) {
+      if (c?.type !== "toolCall") continue;
+      const a = c.arguments ?? {};
+      const path = a.path ?? a.file_path ?? a.file;
+      if (typeof path === "string") (/^(write|edit)/i.test(c.name) ? writes : reads).add(path);
+      else if (typeof a.command === "string") commands.push(clip(a.command.replace(/\s+/g, " "), 100));
+    }
+  }
+  const first = cut.span[0]?.timestamp, end = cut.span.at(-1)?.timestamp;
+  const iso = (t?: number) => (t ? new Date(t).toISOString().slice(0, 19) + "Z" : "?");
+  const list = (s: Iterable<string>, n: number) => { const a = [...s]; return a.length ? a.slice(0, n).join(", ") + (a.length > n ? ` (+${a.length - n} more)` : "") : "none"; };
+  return [
+    `Not summarised: ${cut.span.length} messages, ${iso(first)} to ${iso(end)}, about ${cut.spanTokens} tokens. ` +
+      `Read any of it verbatim with ${RECALL_TOOL} checkpoint=${k} (use match for a detail).`,
+    `Files read: ${list(reads, 30)}.`,
+    `Files written: ${list(writes, 30)}.`,
+    `Commands: ${commands.length ? commands.slice(-10).join(" · ") + (commands.length > 10 ? ` (+${commands.length - 10} earlier)` : "") : "none"}.`,
+    `Last said: ${clip(last.replace(/\s+/g, " "), 400) || "(nothing)"}`,
+  ].join("\n");
+}
+
 /** Plain-text rendering of messages for the recall tool: text, tool calls and tool results, verbatim. */
 export function render(messages: MessageLike[]): string {
+  // A tool result is labelled with the call that produced it, so a matched line says where it came from.
+  const calls = new Map<string, string>();
+  for (const m of messages) if (Array.isArray(m.content)) for (const c of m.content as any[])
+    if (c?.type === "toolCall" && c.id) calls.set(c.id, `${c.name} ${JSON.stringify(c.arguments ?? {})}`.slice(0, 200));
   const out: string[] = [];
   for (const m of messages) {
-    out.push(`## ${m.role}${m.timestamp ? " · " + new Date(m.timestamp).toISOString() : ""}`);
+    const from = m.role === "toolResult" ? calls.get((m as any).toolCallId) : undefined;
+    out.push(`## ${m.role}${m.timestamp ? " · " + new Date(m.timestamp).toISOString() : ""}${from ? " · " + from : ""}`);
     if (typeof m.content === "string") out.push(m.content);
     else if (Array.isArray(m.content)) {
       for (const c of m.content as any[]) {

@@ -2,6 +2,7 @@
 # Same task, three ways, on a free local model; then the bill each would run up on Anthropic.
 #   A: plain pi (no folding)   B: pi compaction at ~8k context   C: pi-context-stack, checkpoint every 6k
 #   C<n>: same, keeping the newest n% of each span verbatim (MODES="A B C C50" picks; default shown)
+#   R, R<n>: reference mode (density 0): no summary turn, an index of each span pointing at recall
 #
 #   bench/run.sh <provider/model> [parts]     e.g. a free local model; 12 files by default
 #
@@ -76,5 +77,7 @@ for m in $modes; do case $m in
   A|B) run "$m" ;;
   C)   run C -e "$here/src/extension.ts" --context-stack-every "$every" ;;
   C*)  PI_CONTEXT_STACK_KEEP=${m#C}% run "$m" -e "$here/src/extension.ts" --context-stack-every "$every" ;;
+  R)   PI_CONTEXT_STACK_DENSITY=0 run R -e "$here/src/extension.ts" --context-stack-every "$every" ;;
+  R*)  PI_CONTEXT_STACK_DENSITY=0 PI_CONTEXT_STACK_KEEP=${m#R}% run "$m" -e "$here/src/extension.ts" --context-stack-every "$every" ;;
 esac; done
 echo "artifacts: $out"

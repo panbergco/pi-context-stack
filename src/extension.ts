@@ -21,7 +21,7 @@ import {
   type Checkpoint, type Cut, type MessageLike, type Settings, type StackState,
   DEFAULTS, NUDGE_TYPE, PROMPT_TYPE, RECALL_TOOL, RESUME_LINE, RESUME_TYPE, SUMMARY_MARKER,
   anchorFor, chooseCut, emptyState, estimateTokens, everyTokens, parseEvery, parseShare, placeSummaryBreakpoint,
-  project, render, spanOf, summaryPrompt, tailTokens, textOf,
+  project, referenceSummary, render, spanOf, summaryPrompt, tailTokens, textOf,
 } from "./stack.ts";
 import { startControl } from "./control.ts";
 
@@ -42,8 +42,8 @@ export function parseSettings(raw: Record<string, unknown>): Partial<Settings> {
   }
   for (const key of ["keep", "density"] as const) {
     if (raw[key] === undefined) continue;
-    const v = parseShare(raw[key]);
-    if (v === undefined || (key === "keep" && v > 0.9) || (key === "density" && v === 0)) throw new Error(`${key}: want a share like 20% or 0.2, got "${raw[key]}"`);
+    const v = key === "density" && /^(off|reference|ref)$/i.test(String(raw[key])) ? 0 : parseShare(raw[key]);
+    if (v === undefined || (key === "keep" && v > 0.9)) throw new Error(`${key}: want a share like 20% or 0.2${key === "density" ? " (0 = reference mode)" : ""}, got "${raw[key]}"`);
     out[key] = v;
   }
   return out;
@@ -68,6 +68,7 @@ export default function contextStack(pi: ExtensionAPI) {
   let pending: "none" | "wanted" | "asked" = "none";
   let cut: (Cut & { askedAt: number }) | null = null; // the span the pending summary request covers
   let resume = false;       // the checkpoint interrupted a run: continue it after the summary
+  let supplied: string | undefined; // a caller's summary waiting for the next turn boundary
   let watchResume = false;  // a resumed run has not yet made a tool call: nudge once if it settles
   let warmUntil = 0;
   let liveTail = 0;         // estimated tokens of the live tail, as of the last request
@@ -120,6 +121,23 @@ export default function contextStack(pi: ExtensionAPI) {
   const resolveAnchor = (needle: string | undefined): number | null =>
     needle ? anchorFor(sessionMessages(), needle) : state.anchorTs;
 
+  /**
+   * A checkpoint whose text needs no model: reference mode (density 0), or a summary the caller supplied (an
+   * orchestrator's own record). Recorded at once; no turn, no output tokens.
+   */
+  const commitWithoutModel = (supplied?: string): any | null => {
+    const c = chooseCut(sessionMessages(), state);
+    if (!c) return null;
+    const k = state.checkpoints.length + 1;
+    const summary = supplied ?? referenceSummary(c, k);
+    const cp: Checkpoint = { k, summary, cutTs: c.cutTs, fromTs: c.fromTs, takenAt: Date.now(), spanTokens: c.spanTokens,
+      summaryTokens: estimateTokens([{ role: "custom", content: summary }]) };
+    state = { ...state, checkpoints: [...state.checkpoints, cp] };
+    pending = "none"; cut = null; liveTail = 0;
+    announce();
+    return { type: "custom", customType: CHECKPOINT, data: cp };
+  };
+
   /** Pick the span and build the summary request for it. null = nothing to summarise. */
   const prepareAsk = () => {
     const c = chooseCut(sessionMessages(), state);
@@ -131,7 +149,7 @@ export default function contextStack(pi: ExtensionAPI) {
   };
 
   /** One checkpoint request. Mid-run: at the next turn boundary. Idle: now, as its own turn. */
-  const checkpointNow = (opts: { maxIdleSec?: number } = {}) => {
+  const checkpointNow = (opts: { maxIdleSec?: number; summary?: string } = {}) => {
     if (pending !== "none") return; // one at a time
     const idle = ctxRef?.isIdle?.() !== false;
     if (idle && opts.maxIdleSec !== undefined) {
@@ -140,6 +158,12 @@ export default function contextStack(pi: ExtensionAPI) {
     }
     if (idle && ctxRef && !chooseCut(sessionMessages(), state)) throw new Error("nothing new since the last checkpoint");
     if (!state.enabled) save({ enabled: true });
+    if (opts.summary !== undefined || state.density === 0) {
+      if (!idle) { pending = "wanted"; supplied = opts.summary; announce(); return; } // at the next turn boundary
+      const entry = commitWithoutModel(opts.summary);
+      if (entry) pi.appendEntry(CHECKPOINT, entry.data);
+      return;
+    }
     if (!idle) { pending = "wanted"; announce(); return; }
     const ask = prepareAsk();
     if (!ask) return;
@@ -155,7 +179,7 @@ export default function contextStack(pi: ExtensionAPI) {
       if (d.anchor && a === null) throw new Error(`no user message contains "${d.anchor}"`);
       save({ enabled: true, anchorTs: a });
     } else if (op === "disable") save({ enabled: false });
-    else if (op === "checkpoint") checkpointNow({ maxIdleSec: d.maxIdleSec });
+    else if (op === "checkpoint") checkpointNow({ maxIdleSec: d.maxIdleSec, ...(typeof d.summary === "string" ? { summary: d.summary } : {}) });
     else if (op === "every" || op === "keep" || op === "density") {
       const patch = parseSettings({ [op]: d.value ?? d.tokens });
       save({ ...patch, enabled: op === "every" && patch.every === null ? state.enabled : true });
@@ -283,6 +307,12 @@ export default function contextStack(pi: ExtensionAPI) {
     const grown = liveTail + estimateTokens([event.message, ...(event.toolResults ?? [])]);
     const every = everyNow();
     if (pending === "none" && state.enabled && every && grown >= every) pending = "wanted";
+    if (pending === "wanted" && (supplied !== undefined || state.density === 0)) {
+      const entry = commitWithoutModel(supplied); // no turn: the run goes on as it would have
+      supplied = undefined;
+      if (!entry) { pending = "none"; announce(); return; }
+      return { entries: [entry] };
+    }
     if (pending === "wanted") {
       resume = (event.toolResults?.length ?? 0) > 0; // tool results pending = the run was going to continue
       const ask = prepareAsk();
@@ -316,15 +346,33 @@ export default function contextStack(pi: ExtensionAPI) {
     parameters: {
       type: "object",
       properties: {
-        checkpoint: { type: "integer", minimum: 1, description: "Checkpoint number k" },
+        checkpoint: { type: "integer", minimum: 1, description: "Checkpoint number k. Omit it with match to search every checkpoint" },
         offset: { type: "integer", minimum: 0, description: "Character offset into the span (default 0)" },
         limit: { type: "integer", minimum: 1000, maximum: 100000, description: "Characters to return (default 20000)" },
         match: { type: "string", description: "Only lines containing this text (case-insensitive), with 1 line of context each" },
       },
-      required: ["checkpoint"],
+      required: [],
     },
-    async execute(_id: string, params: { checkpoint: number; offset?: number; limit?: number; match?: string }) {
-      const k = params.checkpoint;
+    async execute(_id: string, params: { checkpoint?: number; offset?: number; limit?: number; match?: string }) {
+      if (params.checkpoint === undefined) {
+        if (!params.match) throw new Error("give a checkpoint number, or a match to search every checkpoint");
+        if (!state.checkpoints.length) throw new Error("no checkpoints yet");
+        const parts: string[] = [];
+        for (const c of state.checkpoints) {
+          const t = recallOne(c.k, { match: params.match, limit: params.limit ?? 100000 }).content[0].text as string;
+          if (!t.startsWith("no line")) parts.push(`# checkpoint ${c.k}\n${t.replace(/\n\n\[chars [^\]]*\]$/, "")}`);
+        }
+        const all = parts.length ? parts.join("\n\n") : `no line in any of the ${state.checkpoints.length} checkpoints contains "${params.match}"`;
+        const limit = params.limit ?? 20000;
+        return { content: [{ type: "text", text: all.length > limit ? all.slice(0, limit) + `\n\n[first ${limit} of ${all.length} chars: narrow the match]` : all }], details: { matches: parts.length } };
+      }
+      return recallOne(params.checkpoint, params);
+    },
+  } as any);
+
+  /** One checkpoint's originals: whole (sliced by offset/limit) or only the lines matching `match`, with their headers. */
+  function recallOne(k: number, params: { offset?: number; limit?: number; match?: string }): any {
+    {
       if (!state.checkpoints[k - 1]) throw new Error(`no checkpoint ${k}; there are ${state.checkpoints.length}`);
       let text = render(spanOf(sessionMessages(), state, k));
       if (params.match) {
@@ -334,16 +382,22 @@ export default function contextStack(pi: ExtensionAPI) {
         lines.forEach((l, i) => { if (l.toLowerCase().includes(needle)) for (let j = i - 1; j <= i + 1; j++) if (j >= 0 && j < lines.length) keep.add(j); });
         if (!keep.size) return { content: [{ type: "text", text: `no line in checkpoint ${k} contains "${params.match}"` }], details: { k, matches: 0 } };
         const out: string[] = [];
-        let last = -2;
-        for (const i of [...keep].sort((a, b) => a - b)) { if (i > last + 1) out.push("…"); out.push(lines[i]); last = i; }
+        let last = -2, header = -1;
+        for (const i of [...keep].sort((a, b) => a - b)) {
+          // each hit carries the header of its message (role, time, and for a tool result the call that made it)
+          let hd = i; while (hd >= 0 && !lines[hd].startsWith("## ")) hd--;
+          if (hd >= 0 && hd !== header && !keep.has(hd)) { out.push(lines[hd]); header = hd; }
+          if (i > last + 1) out.push("…");
+          out.push(lines[i]); last = i;
+        }
         text = out.join("\n");
       }
       const from = Math.min(params.offset ?? 0, text.length);
       const to = Math.min(text.length, from + (params.limit ?? 20000));
       const more = to < text.length ? `\n\n[chars ${from}-${to} of ${text.length}; continue with offset=${to}]` : `\n\n[chars ${from}-${to} of ${text.length}: end of checkpoint ${k}]`;
       return { content: [{ type: "text", text: text.slice(from, to) + more }], details: { k, from, to, total: text.length } };
-    },
-  } as any);
+    }
+  }
 
   const sliceTo = (ctx: any, anchorTs: number, file: string) => {
     const lines: string[] = [`# Session slice after anchor ${new Date(anchorTs).toISOString()}`, ""];

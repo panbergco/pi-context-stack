@@ -23,7 +23,7 @@ test("stacking a second summary leaves every earlier byte identical (the cached 
   const a = JSON.stringify(project(history, one)!.slice(0, 5));
   const b = JSON.stringify(project(history, two)!.slice(0, 5));
   assert.equal(a, b);
-  assert.deepEqual(project(history, two)!.map((x: any) => x.timestamp), [1, 2, 3, 4, 100, 200]);
+  assert.deepEqual(project(history, two)!.map((x: any) => x.timestamp), [1, 2, 3, 4, 100, 200, 7], "S2 then the active request (7), which the cut passed");
 });
 
 test("an anchor that is not in the context fails open instead of dropping history", () => {
@@ -65,12 +65,14 @@ test("without an anchor the first user message (the task) stays verbatim ahead o
   assert.deepEqual(project(history, s)!.map((x: any) => x.timestamp), [1, 100, 7, 8]);
 });
 
-test("the request right after a checkpoint ends AT the summary, so the cache breakpoint lands on it", async () => {
+test("after a checkpoint: the summary closes with the resume line, the resume message is hidden, the active request follows", async () => {
+  // The cache entry at Sk's end is held by placeSummaryBreakpoint (Anthropic): measured on Sonnet 5.5 with messages
+  // after Sk, the next checkpoint still read [task..S(k-1)] from cache.
   const { RESUME_TYPE, RESUME_LINE } = await import("../src/stack.ts");
   const s = { enabled: true, anchorTs: null, checkpoints: [{ k: 1, summary: "S1", cutTs: 8, takenAt: 100 }], every: null };
   const out = project([...history, { role: "custom", customType: RESUME_TYPE, timestamp: 101, content: RESUME_LINE }], s)!;
-  assert.equal((out.at(-1) as any).customType, SUMMARY_TYPE);
-  assert.ok(String((out.at(-1) as any).content).endsWith(RESUME_LINE));
+  assert.deepEqual(out.map((x: any) => x.customType ?? x.timestamp), [1, SUMMARY_TYPE, 7]);
+  assert.ok(String((out[1] as any).content).endsWith(RESUME_LINE));
 });
 
 test("chooseCut keeps the newest share verbatim and never starts it on a tool result", async () => {
@@ -101,4 +103,23 @@ test("placeSummaryBreakpoint: adds one on the newest summary; when pi used all 4
   assert.deepEqual(four.messages[0].content[1].cache_control, cc);
   const openai = { messages: [{ role: "user", content: [{ type: "text", text: `${SUMMARY_MARKER} 1` }] }] };
   assert.equal(JSON.stringify(placeSummaryBreakpoint(openai, 1)), JSON.stringify(openai), "no cache_control in the payload: untouched");
+});
+
+test("the newest user request is never folded away: kept verbatim after the stack when a cut passed it", () => {
+  const msgs = [m("user", 1, "task"), m("assistant", 2), m("user", 3, "THE QUESTION"), m("assistant", 4), m("toolResult", 5, "r")];
+  const s = { ...emptyState(), enabled: true, checkpoints: [{ k: 1, summary: "S1", cutTs: 5, takenAt: 100 }] };
+  assert.deepEqual(project(msgs, s)!.map((x: any) => x.timestamp), [1, 100, 3], "task, S1, the question");
+  const s2 = { ...s, checkpoints: [{ k: 1, summary: "S1", cutTs: 2, takenAt: 100 }] };
+  assert.deepEqual(project(msgs, s2)!.map((x: any) => x.timestamp), [1, 100, 3, 4, 5], "already in the tail: not doubled");
+});
+
+test("reference mode never folds the newest step; recalled lines name the tool call they came from", async () => {
+  const { chooseCut, render } = await import("../src/stack.ts");
+  const call = (ts: number, id: string, path: string) => ({ role: "assistant", timestamp: ts, content: [{ type: "toolCall", id, name: "read", arguments: { path } }] });
+  const res = (ts: number, id: string, text: string) => ({ role: "toolResult", timestamp: ts, toolCallId: id, content: [{ type: "text", text }] });
+  const msgs = [m("user", 1, "task"), call(2, "c1", "a.txt"), res(3, "c1", "A " + "a".repeat(400)), call(4, "c2", "b.txt"), res(5, "c2", "B " + "b".repeat(400))];
+  const c = chooseCut(msgs, { ...emptyState(), enabled: true, density: 0, keep: 0 })!;
+  assert.deepEqual(c.kept.map((x) => x.timestamp), [4, 5], "the newest step (call + its result) stays");
+  assert.equal(chooseCut(msgs.slice(0, 3), { ...emptyState(), enabled: true, density: 0, keep: 0 }), null, "only the newest step is new");
+  assert.match(render(msgs), /## toolResult · [^\n]* · read \{"path":"b.txt"\}/);
 });

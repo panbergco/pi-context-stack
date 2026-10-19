@@ -9,6 +9,7 @@ Checkpoints instead of compaction, for pi: a session (an autonomous agent, say) 
 
 - **A checkpoint is a normal turn.** The model writes the summary on its own *cached* context (read at 0.1×), instead of compaction's separate, uncached summarisation request.
 - **Summaries are stacked, never refolded.** Each covers only the span since the previous checkpoint; S1 is never compressed again.
+- **Reference mode: effectively unbounded history.** With `density: 0` a checkpoint costs no model turn and about 200 tokens of stack, so a 1M window holds thousands of them; the base context pi loads is the fixed start, and every span stays one recall away. The request being worked on, and the newest step's results, are never folded.
 - **Lossless.** Nothing leaves the session file. The `context_stack_recall` tool hands the model any summary's originals back verbatim, in slices, as an ordinary appended tool result.
 - **Only the new summary is a cache write.** The request after checkpoint k reads `[task..S(k-1)]` from cache and writes `Sk` (plus whatever `keep` retains). On Anthropic the extension puts a cache breakpoint on the newest summary (pi uses the other three/four).
 - **It drives itself.** On by default: a checkpoint every 10% of the context window, and in place of pi's threshold compaction. A checkpoint taken mid-run resumes the run.
@@ -23,7 +24,7 @@ A short skill (`skills/pi-context-stack/SKILL.md`) ships with it: what the exten
 | `enabled` | `true` | Project the context and replace threshold compaction. |
 | `every` | `10%` | Checkpoint when the live tail reaches this: a share of the model's window (`10%`) or tokens (`100k`), or `off` (then only on demand and at pi's threshold). |
 | `keep` | `0%` | Newest share of the tail since the last checkpoint kept verbatim at each checkpoint (up to 90%). Counted only from after the last checkpoint, never the task or the summaries. The kept part never starts on a tool result. |
-| `density` | `5%` | Target summary length as a share of the span it replaces: 5% of a 100k span asks for about 5k tokens. |
+| `density` | `5%` | Target summary length as a share of the span it replaces: 5% of a 100k span asks for about 5k tokens. `0` (or `reference`) is **reference mode**: no summary turn at all; each checkpoint is a deterministic index of its span (size, time, files read and written, commands, the last thing said) pointing at recall. |
 | `replaceCompaction` | `true` | Take a checkpoint instead of pi's threshold compaction. `false` leaves compaction to pi (or to another extension that manages it). With `every: off` too, checkpoints happen only when asked: event-driven, e.g. when an orchestrator finishes a task. |
 
 Later wins: defaults · `~/.pi/agent/context-stack.json` · `<project>/.pi/context-stack.json` · `PI_CONTEXT_STACK_ENABLED|EVERY|KEEP|DENSITY|REPLACE_COMPACTION` · `--context-stack` / `--context-stack-every` · this session's `/stack` or CLI change (saved in the session, so it survives a resume).
@@ -89,6 +90,8 @@ Overflow recovery and manual `/compact` stay pi's.
 | C: pi-context-stack | 30/30 | 8/8, 6 targeted recalls (`match`) | 39.8k | 39 (3 checkpoints) | $0.436 |
 
 C answers like A at the cost of B, with the context held at 40% of A's. Summaries came out at 2.1–3.3% of their span against a 5% target (the model writes shorter than asked). Variance seen: with the follow-up worded "answer from what you know", the model declined to recall (2/8); with whole-span recalls (before `match`) one run paid $0.18 for 71k tokens of recall. A grows without bound: its cache reads scale with the square of the run length (one more file re-reads everything before it), C's with its length.
+
+Reference mode on the same task (no summary turns): 30/30 codes, 8/8 withheld, **$0.394** with 0% kept, $0.404 with 20% kept. Two fixes came from its first runs: the active request is kept verbatim after the stack (a cut had folded the question away), and reference mode keeps the newest step (it had folded six fresh recall results, which were then fetched again).
 
 **On a free local model** (earlier, 12 files):
 

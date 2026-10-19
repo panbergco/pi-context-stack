@@ -51,7 +51,7 @@ test("threshold compaction becomes a checkpoint: cancel, ask with a density targ
   const r = h.reply("THE SUMMARY");
   h.apply(await h.handlers.turn_end({ toolResults: [], context: { contextMessages: h.msgs() } }));
   const out = (await h.handlers.context({ messages: h.msgs() })).messages;
-  assert.deepEqual(out.map((m: any) => m.customType ?? m.role), ["user", SUMMARY_TYPE], "task, then S1; the request and reply are hidden");
+  assert.deepEqual(out.map((m: any) => m.customType ?? m.role), ["user", SUMMARY_TYPE, "user"], "task, S1, then the active request; the summary request and reply are hidden");
   assert.ok(r.timestamp);
 });
 
@@ -215,4 +215,40 @@ test("a compaction (e.g. an orchestrator's reset) voids the stack: no stale summ
   assert.equal(await h.handlers.context({ messages: fresh }), undefined, "live: nothing projected after the reset");
   await h.handlers.session_start({}, h.ctx); // and after a resume, rebuilt from the branch
   assert.equal(await h.handlers.context({ messages: fresh }), undefined, "resumed: the checkpoint before the compaction is void");
+});
+
+test("reference mode (density 0): no summary turn; an index of the span pointing at recall; the originals stay reachable", async () => {
+  process.env.PI_CONTEXT_STACK_DENSITY = "0";
+  const h = harness();
+  await h.handlers.session_start({}, h.ctx);
+  delete process.env.PI_CONTEXT_STACK_DENSITY;
+  h.add("user", "THE TASK");
+  h.add("assistant", "reading", { content: [{ type: "text", text: "reading the config" }, { type: "toolCall", name: "read", arguments: { path: "src/a.ts" } }] });
+  h.add("toolResult", "CONFIG BODY " + x(4000));
+  h.add("assistant", "edit", { content: [{ type: "text", text: "Fixed the parser; next I run the tests." }, { type: "toolCall", name: "edit", arguments: { path: "src/b.ts" } }, { type: "toolCall", name: "bash", arguments: { command: "npm test" } }] });
+  h.pi.events.emit("context-stack:command", { op: "checkpoint" }); // idle: recorded at once
+  assert.equal(h.sent.length, 0, "no model turn");
+  const cp = h.branch.find((e) => e.customType === "context-stack:checkpoint").data;
+  // the newest step (the edit + test run nobody has seen the results of) stays verbatim; the rest is indexed
+  assert.match(cp.summary, /Not summarised: 2 messages/);
+  assert.match(cp.summary, /Files read: src\/a.ts/);
+  assert.match(cp.summary, /Files written: none/);
+  assert.match(cp.summary, /Last said: reading the config/);
+  const out = (await h.handlers.context({ messages: h.msgs() })).messages;
+  assert.deepEqual(out.map((m: any) => m.customType ?? m.role), ["user", SUMMARY_TYPE, "assistant"]);
+  const hit = (await h.tools[0].execute("id", { checkpoint: 1, match: "config body" })).content[0].text;
+  assert.match(hit, /CONFIG BODY/);
+  const anywhere = (await (0, h.tools[0].execute)("id", { match: "config body" })).content[0].text;
+  assert.match(anywhere, /# checkpoint 1\n[^]*CONFIG BODY/, "no checkpoint number: every checkpoint is searched");
+});
+
+test("a caller-supplied summary (an orchestrator's record) is used verbatim, mid-run at the next boundary", async () => {
+  const h = harness();
+  await h.handlers.session_start({}, h.ctx);
+  h.setIdle(false);
+  h.add("user", "THE TASK"); h.add("assistant", x(2000)); const tr = h.add("toolResult", x(2000));
+  h.pi.events.emit("context-stack:command", { op: "checkpoint", summary: "RECORD: task 7 shipped; next is task 8" });
+  const r = await h.handlers.turn_end({ toolResults: [tr], message: {} });
+  assert.equal(r.continue, undefined, "no extra turn: the run continues as pi would");
+  assert.equal(r.entries[0].data.summary, "RECORD: task 7 shipped; next is task 8");
 });
